@@ -5,106 +5,110 @@ Niru Maheswaranathan
 """
 
 import os
-import time
+from time import time
 import numpy as np
-
 from scipy.io import loadmat
+
 import theano.tensor as T
 import theano
 
+from sfo.sfo import SFO
+
 class LogisticRegression(object):
+
+    def __init__(self, train_data, test_data):
+
+        # data is a list of minibatches, each element of which is a dictionary with x and y keys
+        # x: num_features, num_samples
+        # y: num_samples,
+        self.train = train_data
+        self.test  = test_data
+
+        # initialize parameters
+        self.num_classes = np.unique(np.hstack([t['y'] for t in self.train])).size
+        self.num_features = train_data[0]['x'].shape[1]
+        self.minibatch_size = train_data[0]['y'].size
+        self.theta_init = 1e-4*np.random.randn(self.num_features, self.num_classes).ravel()
+
+        # optimize using SFO
+        self.optimizer = SFO(self.f_df_wrapper, self.theta_init, self.train, display=2)
+
+        # theano variables
+        tx = T.matrix('x')
+        tw = T.matrix('theta')
+        ty = T.ivector('y')
+
+        # negative log-likelihood objective
+        self.p_y_given_x = T.nnet.softmax(tx.dot(tw))
+        self.y_pred = theano.function([tx,tw], T.argmax(self.p_y_given_x, axis=1))
+        self.loss = -T.mean(T.log(self.p_y_given_x)[np.arange(self.minibatch_size), ty])
+        self.f_df = theano.function([tx, ty, tw], [self.loss, T.grad(self.loss, tw)])
+
+    def f_df_wrapper(self, theta, data):
+        """
+        wrap the symbolic f_df function, passing in data from a single minibatch
+        """
+        theta_matrix = theta.reshape(self.num_features, self.num_classes)
+        f, df = self.f_df(data['x'], data['y'], theta_matrix)
+        return f, df.ravel()
+
+    def fit(self, num_passes=5):
+        """
+        Optimize the logistic regression model using SFO
+        """
+
+        # fit
+        theta_vector = self.optimizer.optimize(num_passes=num_passes)
+        self.theta = theta_vector.reshape(self.num_features, self.num_classes)
+
+        # test
+        frac_correct = self.classify(self.theta)
+        print('---------------------------------------------')
+        print('--- Fraction correct on test set: %5.4f ---' % frac_correct)
+        print('---------------------------------------------')
+
+        return frac_correct
+
+    def classify(self, theta):
+        ypred = np.hstack([self.y_pred(t['x'], theta) for t in self.test])
+        ytrue = np.hstack([t['y'] for t in self.test])
+        frac_correct = np.mean(ypred-ytrue == 0)
+        return frac_correct
+
+def load_data(minibatch_size=100, frac_train=0.8, datadir='~/data/mldata/'):
     """
-    Multi-class logistic regression
-    """
-
-    def __init__(self, input, n_in, n_out):
-        """
-        initializes the logistic regression model
-        :param input:
-        :param n_in:
-        :param n_out:
-        :return:
-        """
-
-        # initialize the weights W as a zeros matrix of shape (n_in, n_out)
-        self.W = theano.shared(value=np.zeros((n_in, n_out), dtype=theano.config.floatX),
-                               name='W', borrow=True)
-
-        # initialize the biases b as a vector of zeros
-        self.b = theano.shared(value=np.zeros((n_out,), dtype=theano.config.floatX),
-                               name='b', borrow=True)
-
-        # symbolic expression for computing the matrix of class-membership probabilities
-        # i.e. p(y | x, W, b) = softmax(Wx + b)
-        self.p_y_given_x = T.nnet.softmax(T.dot(input, self.W) + self.b)
-
-        # compute prediction from probabilities
-        self.y_pred = T.argmax(self.p_y_given_x, axis=1)
-
-        # parameters of the model
-        self.params = [self.W, self.b]
-
-    def negative_log_likelihood(self, y):
-        """
-        defines the negative log-likelihood objective
-        returns the mean of the neg. LL of the prediction over the data
-
-        :param y:
-        :return:
-        """
-        return -T.mean(T.log(self.p_y_given_x)[T.arange(y.shape[0]), y])
-
-    def errors(self, y):
-        """
-        returns a float representation of the fraction of errors in the minibatch
-        :param y:
-        :return:
-        """
-        return T.mean(T.neg(self.y_pred, y))
-
-def load_data(frac_train, datadir='/data/mldata/', seed=1234):
-    """
-    loads MNIST data and selects train / test indicse
+    loads MNIST data and selects train / test indices
     :param datadir:
     :param frac_train:
     :return:
     """
-    np.random.seed(seed)
 
     # load data
-    mnist = loadmat(os.path.join(datadir, 'mnist-original.mat'))
+    mnist = loadmat(os.path.join(os.path.expanduser(datadir), 'mnist-original.mat'))
 
-    # select train / test indices
+    # select random train / test indices
     num_samples = mnist['label'].size
     num_train = np.round(frac_train * num_samples).astype('int')
     indices = np.arange(num_samples)
     np.random.shuffle(indices)
-    train_indices = indices[:num_train]
-    test_indices  = indices[num_train:]
 
-    # return data
-    train_data = {'input':   mnist['data'].take(train_indices, axis=1),
-                  'labels': mnist['label'].take(train_indices, axis=1)}
+    # comprehension to generate train and test data set
+    train_data = [{'x': np.vstack((mnist['data'].take(idx,axis=1), np.ones((1,minibatch_size)))).T,
+                   'y': mnist['label'].take(idx,axis=1).ravel().astype('int32')}
+                  for idx in indices[:num_train].reshape(-1, minibatch_size)]
 
-    test_data = {'input':   mnist['data'].take(test_indices, axis=1),
-                 'labels': mnist['label'].take(test_indices, axis=1)}
+    test_data  = [{'x': np.vstack((mnist['data'].take(idx,axis=1), np.ones((1,minibatch_size)))).T,
+                   'y': mnist['label'].take(idx,axis=1).ravel().astype('int32')}
+                  for idx in indices[num_train:].reshape(-1, minibatch_size)]
 
     return train_data, test_data
 
-def sgd_mnist(learning_rate=0.1, n_epochs=1000, frac_train=0.8):
+if __name__ == '__main__':
 
-    train_data, test_data = load_data(frac_train)
+    # set random seed
+    np.random.seed(1234)
 
-    # x = T.matrix('x')
-    # y = T.ivector('y')
-    # classifier = LogisticRegression(input=x, n_in=28*28, n_out=10)
-    # cost = classifier.negative_log_likelihood(y)
+    # load train / test data, split into minibatches
+    train, test = load_data()
+
     #
-    # theano.function(
-    #     inputs=[index],
-    #     outputs=cost,
-    #     givens={
-    #         x: train_set_x
-    #         y: train_set_y
-    #     }
-    # )
